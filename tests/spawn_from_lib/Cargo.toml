@@ -1,0 +1,16 @@
+[package]
+edition = "2021"
+name = "test_spawn_from_lib"
+version = "0.0.1"
+
+[lib]
+# needs to by dylib for the trampoline tests to work correctly
+crate-type = ["dylib"]
+
+[dependencies]
+libc = {version = "0.2"}
+
+[dev-dependencies]
+anyhow = {version = "1.0"}
+spawn_worker = {path = "../../spawn_worker"}
+tempfile = {version = "3.3"}
