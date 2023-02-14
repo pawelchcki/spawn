@@ -1,10 +1,15 @@
+#![cfg(feature = "prefer-dynamic")]
+
 use std::{
     fs::File,
     io::{Read, Seek},
     os::fd::OwnedFd,
 };
 
-use spawn_worker::{spawn::{SpawnCfg, Target}, WaitStatus};
+use spawn_worker::{
+    spawn::{SpawnCfg, Target},
+    WaitStatus,
+};
 use test_spawn_from_lib::secret_main_loop;
 
 fn rewind_and_read_fd(fd: OwnedFd) -> anyhow::Result<String> {
@@ -16,7 +21,9 @@ fn rewind_and_read_fd(fd: OwnedFd) -> anyhow::Result<String> {
     Ok(buf)
 }
 
+/// run with: RUSTFLAGS="-C prefer-dynamic" cargo test --features prefer-dynamic -- --ignored
 #[test]
+#[ignore = "requires -C prefer-dynamic"]
 fn test_spawning_trampoline_worker() {
     let stdout = tempfile::tempfile().unwrap();
     let stderr = tempfile::tempfile().unwrap();

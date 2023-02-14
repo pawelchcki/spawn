@@ -1,17 +1,10 @@
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::{
-        ffi::{self, CStr, CString},
-        io::{Seek, Write},
-        os::fd::AsRawFd,
-        ptr::{self},
-    };
+    use std::io::{Seek, Write};
 
-    use crate::{spawn::Target, Fork, TRAMPOLINE_BIN};
+    use crate::TRAMPOLINE_BIN;
 
-    use super::SpawnCfg;
-
-    fn write_trampoline() -> anyhow::Result<memfd::Memfd> {
+    pub(crate) fn write_trampoline() -> anyhow::Result<memfd::Memfd> {
         let opts = memfd::MemfdOptions::default();
         let mfd = opts.create("spawn_worker_trampoline")?;
 
@@ -21,79 +14,67 @@ mod linux {
 
         Ok(mfd)
     }
+}
 
-    fn spawn_fd<T: AsRawFd>(fd: T, cfg: &SpawnCfg) -> anyhow::Result<Option<libc::pid_t>> {
-        let fd = fd.as_raw_fd();
-        static PROG_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"trampoline\0") };
-        let mut argv: Vec<*const ffi::c_char> = vec![PROG_NAME.as_ptr()];
-        let mut string_store: Vec<CString> = vec![];
+#[derive(Default)]
+struct ExecVec {
+    data: Vec<CString>,
+    ptrs: Vec<*const ffi::c_char>,
+}
 
-        match &cfg.target {
-            Target::Trampoline(f) => {
-                let (library_path, symbol_name) =
-                    match unsafe { crate::get_dl_path_raw(*f as *const libc::c_void) } {
-                        (Some(p), Some(n)) => (p, n),
-                        _ => return Err(anyhow::format_err!("can't read symbol pointer data")),
-                    };
+struct SealedExecVec {
+    _data: Vec<CString>,
+    ptrs: Vec<*const ffi::c_char>,
+}
 
-                argv.push(library_path.as_ptr());
-                string_store.push(library_path); // ensure the data is kept around until process forks
+impl SealedExecVec {
+    fn as_ptr(&self) -> *const *const i8 {
+        self.ptrs.as_ptr()
+    }
+}
 
-                argv.push(symbol_name.as_ptr());
-                string_store.push(symbol_name);
-            }
-            Target::ManualTrampoline(library_path, symbol_name) => {
-                argv.push(library_path.as_ptr());
-                argv.push(symbol_name.as_ptr());
-            }
-            Target::Fork(_) => todo!(),
-            Target::Noop => return Ok(None),
-        };
-
-        // list must be null terminated
-        argv.push(ptr::null());
-
-        let mut envp: Vec<*const ffi::c_char> = vec![];
-
-        let mut environs: Vec<CString> = vec![];
-        if cfg.inherit_env {
-            for (k, v) in std::env::vars() {
-                environs.push(CString::new(format!("{k}={v}"))?);
-            }
-        }
-
-        for env in &environs {
-            envp.push(env.as_ptr());
-        }
-
-        envp.push(ptr::null());
-
-        match unsafe { crate::fork()? } {
-            Fork::Parent(child_pid) => Ok(Some(child_pid)),
-            Fork::Child => unsafe {
-                if let Some(fd) = &cfg.stdin {
-                    libc::dup2(fd.as_raw_fd(), libc::STDIN_FILENO);
-                }
-
-                if let Some(fd) = &cfg.stdout {
-                    libc::dup2(fd.as_raw_fd(), libc::STDOUT_FILENO);
-                }
-
-                if let Some(fd) = &cfg.stderr {
-                    libc::dup2(fd.as_raw_fd(), libc::STDERR_FILENO);
-                }
-
-                // not using nix crate here, as it would allocate args after fork, which will lead to crashes on systems
-                // where allocator is not fork+thread safe
-                libc::fexecve(fd, argv.as_ptr(), envp.as_ptr());
-                std::process::exit(1);
-            },
-        }
+impl ExecVec {
+    fn push(&mut self, item: CString) {
+        self.ptrs.push(item.as_ptr());
+        self.data.push(item);
     }
 
-    pub fn spawn_trampoline(cfg: &SpawnCfg) -> anyhow::Result<Option<libc::pid_t>> {
-        let fd = write_trampoline()?;
-        spawn_fd(fd, cfg)
+    fn seal(mut self) -> SealedExecVec {
+        self.ptrs.push(ptr::null());
+        SealedExecVec {
+            _data: self.data,
+            ptrs: self.ptrs,
+        }
+    }
+}
+
+fn write_trampline() -> anyhow::Result<tempfile::NamedTempFile> {
+    let tmp_file = tempfile::NamedTempFile::new()?;
+    let mut file = tmp_file.as_file();
+    file.set_len(TRAMPOLINE_BIN.len() as u64)?;
+    file.write_all(TRAMPOLINE_BIN)?;
+    file.rewind()?;
+
+    std::fs::set_permissions(tmp_file.path(), Permissions::from_mode(0o700))?;
+
+    Ok(tmp_file)
+}
+
+pub enum SpawnMethod {
+    #[cfg(target_os = "linux")]
+    FdExec,
+    Exec,
+}
+
+impl Default for SpawnMethod {
+    #[cfg(target_os = "linux")]
+    fn default() -> Self {
+        Self::FdExec
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn default() -> Self {
+        Self::Exec
     }
 }
 
@@ -108,6 +89,7 @@ pub struct SpawnCfg {
     stdin: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
+    spawn_method: SpawnMethod,
     target: Target,
     inherit_env: bool,
 }
@@ -120,6 +102,7 @@ impl SpawnCfg {
             stderr: None,
             target: Target::Noop,
             inherit_env: true,
+            spawn_method: Default::default(),
         }
     }
 
@@ -144,7 +127,7 @@ impl SpawnCfg {
     }
 
     pub fn spawn(&mut self) -> anyhow::Result<Child> {
-        let pid = spawn_trampoline(self)?;
+        let pid = self.do_spawn()?;
 
         Ok(Child {
             pid,
@@ -152,6 +135,91 @@ impl SpawnCfg {
             stderr: self.stderr.take(),
             stdout: self.stdout.take(),
         })
+    }
+
+    fn do_spawn(&self) -> anyhow::Result<Option<libc::pid_t>> {
+        let mut argv = ExecVec::default();
+        // set prog name (argv[0])
+        argv.push(CString::new("trampoline")?);
+
+        let spawn: Box<dyn Fn(&SealedExecVec, &SealedExecVec)> = match &self.spawn_method {
+            #[cfg(target_os = "linux")]
+            SpawnMethod::FdExec => {
+                let fd = linux::write_trampoline()?;
+                Box::new(move |argv, envp| {
+                    // not using nix crate here, as it would allocate args after fork, which will lead to crashes on systems
+                    // where allocator is not fork+thread safe
+                    unsafe { libc::fexecve(fd.as_raw_fd(), argv.as_ptr(), envp.as_ptr()) };
+                    // if we're here then exec has failed
+                    panic!("{}", std::io::Error::last_os_error());
+                })
+            }
+            SpawnMethod::Exec => {
+                let path = CString::new(
+                    write_trampline()?
+                        .into_temp_path()
+                        .keep()? // ensure the file is not auto cleaned in parent process
+                        .as_os_str()
+                        .to_str()
+                        .ok_or_else(|| anyhow::format_err!("can't convert tmp file path"))?,
+                )?;
+
+                Box::new(move |argv, envp| {
+                    // not using nix crate here, to avoid allocations post fork
+                    unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+                    // if we're here then exec has failed
+                    panic!("{}", std::io::Error::last_os_error());
+                })
+            }
+        };
+
+        match &self.target {
+            Target::Trampoline(f) => {
+                let (library_path, symbol_name) =
+                    match unsafe { crate::get_dl_path_raw(*f as *const libc::c_void) } {
+                        (Some(p), Some(n)) => (p, n),
+                        _ => return Err(anyhow::format_err!("can't read symbol pointer data")),
+                    };
+                argv.push(library_path);
+                argv.push(symbol_name);
+            }
+            Target::ManualTrampoline(library_path, symbol_name) => {
+                argv.push(library_path.clone());
+                argv.push(symbol_name.clone());
+            }
+            Target::Fork(_) => todo!(),
+            Target::Noop => return Ok(None),
+        };
+
+        let argv = argv.seal();
+
+        let mut envp = ExecVec::default();
+
+        if self.inherit_env {
+            for (k, v) in std::env::vars() {
+                envp.push(CString::new(format!("{k}={v}"))?);
+            }
+        }
+
+        let envp = envp.seal();
+
+        if let Fork::Parent(child_pid) = unsafe { crate::fork()? } {
+            return Ok(Some(child_pid));
+        }
+        if let Some(fd) = &self.stdin {
+            unsafe { libc::dup2(fd.as_raw_fd(), libc::STDIN_FILENO) };
+        }
+
+        if let Some(fd) = &self.stdout {
+            unsafe { libc::dup2(fd.as_raw_fd(), libc::STDOUT_FILENO) };
+        }
+
+        if let Some(fd) = &self.stderr {
+            unsafe { libc::dup2(fd.as_raw_fd(), libc::STDERR_FILENO) };
+        }
+
+        spawn(&argv, &envp);
+        std::process::exit(1);
     }
 }
 impl Default for SpawnCfg {
@@ -178,8 +246,17 @@ impl Child {
     }
 }
 
-use std::{ffi::CString, os::fd::OwnedFd};
+use std::{
+    ffi::{self, CString},
+    fs::Permissions,
+    io::{Seek, Write},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::prelude::PermissionsExt,
+    },
+    ptr,
+};
 
-#[cfg(target_os = "linux")]
-pub use linux::spawn_trampoline;
 use nix::{sys::wait::WaitStatus, unistd::Pid};
+
+use crate::{Fork, TRAMPOLINE_BIN};
